@@ -344,29 +344,28 @@ def cfr_optimize(cobra_model, on_list:list=[], off_list:list=[],
                 fluxes = pd.Series(np.nan, index=r_dict.keys())
                 objective = np.nan
         elif solver=='glpk': 
-            on_names = list(chain(*[('x_' + rxn + '_lower', 'x_' + rxn + '_upper') for rxn in on_rxns]))
-            off_names = list(chain(*[('x_' + rxn + '_lower', 'x_' + rxn + '_upper') for rxn in off_rxns]))
+            on_names = list(chain(*[('x_' + rxn + '_lower_on', 'x_' + rxn + '_upper_on') for rxn in on_rxns]))
+            off_names = list(chain(*[('x_' + rxn + '_lower_off', 'x_' + rxn + '_upper_off') for rxn in off_rxns]))
             pfba_names = list(chain(*[('x_' + rxn + '_lower_pfba', 'x_' + rxn + '_upper_pfba') for rxn in pfba_rxns]))
             x_names = list(r_dict.keys()) + on_names + off_names + pfba_names
-            x_list = [opt_variable(n, l, u, v) for n, l, u, v in tqdm(zip(x_names, lb, ub, vtype), desc='Defining variables', total=len(x_names))]
-            c_list = [opt_constraint(x_list[0], s, b) for s, b in tqdm(zip(sense, rhs), desc='Defining constraints', total=A.shape[0])]
+            x_list = [opt_variable(n, l, u, v) for n, l, u, v in tqdm(zip(x_names, lb, ub, vtype), desc='Defining variables', total=len(x_names), leave=False)]
+            c_list = [opt_constraint(x_list[0], s, b) for s, b in tqdm(zip(sense, rhs), desc='Defining constraints', total=A.shape[0], leave=False)]
             model = Model('CFR')
             model.add(x_list + c_list)
-            for i, constraint in tqdm(enumerate(model.constraints), desc='Updating constraints', total=len(model.constraints)): 
+            for i, constraint in tqdm(enumerate(model.constraints), desc='Updating constraints', total=len(model.constraints), leave=False): 
                 idx = np.argwhere(A[i, :])[:, 1]
                 if 0 not in idx: 
                     idx = np.append(idx, 0)
                 x = [model.variables[i] for i in idx]
                 c_dict = {v: w for v, w in zip(x, A[i, idx].toarray().reshape((-1,)))}
                 constraint.set_linear_coefficients(c_dict)
-            print('Defining objective')
             j = np.argwhere(c).reshape((-1,))[0]
             model.objective = Objective(c[j] * model.variables[j], direction='max')
             idx = np.arange(start=S.shape[1], stop=A.shape[1], step=1)
             x = [model.variables[i] for i in idx]
             o_dict = {v: w for v, w in zip(x, obj[idx])}
             model.objective.set_linear_coefficients(o_dict)
-            print('Objective defined')
+            model.configuration.timeout = 100
             status = model.optimize()
             if status=='optimal': 
                 fluxes = pd.Series([model.variables[rxn].primal for rxn in r_dict.keys()], index=r_dict.keys())
@@ -483,7 +482,7 @@ def summarize(results):
     # Return output
     return summary
 
-def get_fluxes(results): 
+def get_fluxes(results, metadata:bool=False, cobra_model=None): 
     """
     Extract flux solutions for all conditions in the output for `apply_cfr`.
 
@@ -491,6 +490,9 @@ def get_fluxes(results):
     ----------
     results : list
         A list of Result objects (e.g., output from `apply_cfr`).
+    metadata : bool, optional
+        Boolean flag to return metadata for reaction fluxes. 
+    cobra_model : The COBRA Model object from which `results` was determined from.
 
     Returns
     -------
@@ -503,6 +505,15 @@ def get_fluxes(results):
 
     # Create dataframe of fluxes
     df = pd.DataFrame(fluxes, index=next(iter(fluxes.values())).index)
+
+    # Add metadata (if prompted)
+    if metadata: 
+        dfm = pd.DataFrame({'Reaction': [cobra_model.reactions.get_by_id(rxn).name for rxn in df.index]}, index=df.index)
+        if all('subsystem' in vars(rxn).keys() for rxn in cobra_model.reactions): 
+            dfm['Subsystem'] = [cobra_model.reactions.get_by_id(rxn).name for rxn in dfm.index]
+        else: 
+            dfm['Subsystem'] = np.nan
+        df = dfm.merge(df, left_index=True, right_index=True)
 
     # Return output
     return df
@@ -539,7 +550,7 @@ def process_flux(cobra_model, fluxes, threshold=2):
         raise ValueError('Provide a numeric value for `threshold`')
 
     # Add wild type flux solution
-    df = fluxes.copy()
+    df = fluxes.select_dtypes(include='number').copy()
     with HideOutput(): 
         df['WT'] = cfr_optimize(cobra_model).fluxes
 
@@ -551,6 +562,11 @@ def process_flux(cobra_model, fluxes, threshold=2):
 
     # Binarize based on threshold
     dfb = (dfz.abs() > threshold).astype(int)
+
+    # Add metadata (if it exists)
+    if fluxes.shape[1] > df.shape[1]: 
+        dfm = fluxes.select_dtypes(exclude='number').copy()
+        dfb = dfm.merge(dfb, left_index=True, right_index=True)
 
     # Return output
     return dfb
